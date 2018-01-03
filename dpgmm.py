@@ -1,31 +1,49 @@
 from __future__ import print_function
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import multivariate_normal, wishart
 from scipy.misc import factorial
+from scipy.special import gammaln
 import pandas as pd
 import math
 import sys
 
-def RisingFact(x, n):
-    if (n <= 1):
-        return x
-    else:
-        return x * RisingFact(x + 1, n - 1)
+def logRisingFact(x, n):
+    return np.log(np.arange(n) + x).sum()
 
 class DPGMM:
-    def __init__(self, covar, n_iter = 2000, u0=None,  n_cluster=2, alpha=1., beta=0.3, new=10.):
+    def __init__(self, covar, n_iter = 2000, refresh=20, u0=None,  n_cluster=2, alpha=1., beta=0.3, new=10.):
+        self.covar = covar
         self.n_cluster = n_cluster
         self.u0 = u0
         self.alpha = alpha
         self.beta = beta
         self.new = new
         self.n_iter = n_iter
+        self.refresh = refresh
     
     def getSampleK(self, k, latent_z,):
         sample_idx = np.where(latent_z == k)[0]
         return self.sample[sample_idx]
     
+    def getLogPosteriorProbability(self, latent_z, n_cluster_samples, params, normal_insts):
+        n_sample = len(latent_z)
+        n_i = [None] * len(n_cluster_samples)
+        for idx, c in n_cluster_samples.items():
+            n_i[idx] = c
+        n_i = np.array(n_i)
+        
+        tmp = np.log(self.alpha) * self.n_cluster + gammaln(n_i).sum()
+        p_s = tmp - logRisingFact(self.alpha, n_sample)
+        posterior = p_s
+        for k in range(self.n_cluster):
+            cov = np.linalg.inv(self.beta * params[k][1])
+            p_mean = multivariate_normal(self.u0, cov).logpdf(params[k][0])
+            p_covar = wishart.logpdf(params[k][1], self.new ,self.covar)
+            posterior += p_mean + p_covar
+            sample_k = self.getSampleK(k, latent_z)
+            posterior += normal_insts[k].logpdf(sample_k).sum()
+        return posterior
+        
     def updateParameters(self, latent_z, n_cluster_samples):
         params = []
         normal_insts = []
@@ -44,14 +62,14 @@ class DPGMM:
             tmp2 = (n_cluster_samples[k] * self.beta) / (n_cluster_samples[k] + self.beta)
             tmp3 = tmp2 * tmp1
             
-            wish_cover = np.linalg.inv(np.linalg.inv(covar) + cov_k + tmp3)
+            wish_cover = np.linalg.inv(np.linalg.inv(self.covar) + cov_k + tmp3)
             
             normal_cov = wishart.rvs(self.new + n_cluster_samples[k], wish_cover)
             tmp4 = (n_cluster_samples[k] + self.beta) * normal_cov
             tmp5 = n_cluster_samples[k] + self.beta
             tmp6 = (n_cluster_samples[k] * mean_sample_k + self.beta * self.u0) / tmp5
             normal_mean = multivariate_normal(tmp6, np.linalg.inv(tmp4)).rvs()
-            params.append((normal_mean, np.linalg.inv(normal_cov)))
+            params.append((normal_mean, normal_cov))
             normal_insts.append(multivariate_normal(normal_mean, np.linalg.inv(normal_cov)))
         return params, normal_insts
     
@@ -78,14 +96,14 @@ class DPGMM:
         for j in range(n_sample):
             deviation = self.sample[j] - self.u0
             S_b_inv_1 = np.dot(deviation.reshape(-1, 1), deviation.reshape(1, -1))
-            S_b_inv_2 = np.linalg.inv(covar)
+            S_b_inv_2 = np.linalg.inv(self.covar)
             S_b_inv = S_b_inv_2 + (self.beta / (1 + self.beta)) * S_b_inv_1
             S_b_det = np.linalg.det(np.linalg.inv(S_b_inv))
 
             tmp1 = (self.beta / ((1 + self.beta) * np.pi)) ** (n_dimentions / 2.)
             tmp2 = (self.new + 1.) / 2.
             tmp3 = S_b_det ** tmp2 * math.gamma(tmp2)
-            tmp4 = np.linalg.det(covar) ** (self.new / 2)
+            tmp4 = np.linalg.det(self.covar) ** (self.new / 2)
             tmp5 = tmp3 / (tmp4 * math.gamma((self.new + 1. - n_dimentions) / 2))
             p_x_theta = tmp1 * tmp5
             tmp6 = self.alpha / (n_sample - 1. + self.alpha)
@@ -130,35 +148,42 @@ class DPGMM:
             self.n_cluster = max(latent_z) + 1
             
             params, normal_insts = self.updateParameters(latent_z, n_cluster_samples)
-
-            if i % 100 == 0:
+            
+            posterior = self.getLogPosteriorProbability(latent_z, n_cluster_samples,
+                                                         params, normal_insts)
+            
+            if i % self.refresh == 0:
+                print("=================== %d ==================="%(i))
+                print("posterior:%.2f"%(posterior))
                 print("n_cluster", self.n_cluster)
                 for param in params:
-                    print(" mean", param[0])
-                    print(" cov", param[1])
-                
-np.random.seed(12345)
+                    print("\tmean", param[0])
+                    print("\tcov", np.linalg.inv(param[1]))
 
-n_sample = 500
-n_dimentions = 2
-prob = [0.33, 0.33, 0.34]
-means = [0, 4.5, 9.0]
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    np.random.seed(12345)
 
-prob_cum = np.cumsum(prob)
-sample = []
-for _ in range(n_sample):
-    val = np.random.uniform()
-    param_idx = np.where(prob_cum > val)[0][0]
-    sample_mean = [means[param_idx]] * n_dimentions
-    sample_std = np.eye(n_dimentions)
-    sample.append(np.random.multivariate_normal(sample_mean, sample_std))
-sample = np.array(sample)
+    n_sample = 500
+    n_dimentions = 2
+    prob = [0.33, 0.33, 0.34]
+    means = [0, 4.5, 9.0]
 
-plt.scatter(sample[:,0], sample[:,1])
-plt.show()
+    prob_cum = np.cumsum(prob)
+    sample = []
+    for _ in range(n_sample):
+        val = np.random.uniform()
+        param_idx = np.where(prob_cum > val)[0][0]
+        sample_mean = [means[param_idx]] * n_dimentions
+        sample_std = np.eye(n_dimentions)
+        sample.append(np.random.multivariate_normal(sample_mean, sample_std))
+    sample = np.array(sample)
 
-covar = np.array([[1. , 0.],[0., 1.]])
+    plt.scatter(sample[:,0], sample[:,1])
+    plt.show()
 
-dpgmm = DPGMM(covar, n_iter=1000, alpha=0.1, beta=.3)
-dpgmm.fit(sample)
+    covar = np.array([[1. , 0.],[0., 1.]])
+
+    dpgmm = DPGMM(covar, n_iter=300, refresh=30, alpha=0.1, beta=.3)
+    dpgmm.fit(sample)
 
